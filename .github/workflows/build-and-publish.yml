@@ -1,0 +1,229 @@
+# Publishes a matterjs-server image that covers linux/arm/v7 in addition to the
+# linux/amd64 and linux/arm64 that upstream already ships.
+#
+# amd64 and arm64 are NOT rebuilt — upstream's released images are referenced by digest,
+# so those architectures are bit-identical to what upstream publishes. Only armv7 is
+# built here, because Node 24 ships no 32-bit ARM build and neither does any Debian
+# trixie Node image; it is pinned to Node 22 bookworm, the newest base that has one.
+#
+# The three are then merged into a single manifest list, so a consumer pulls one tag and
+# Docker resolves the right architecture. The registry owner is derived from the
+# repository, so transferring this repo to another org changes where it publishes with
+# no edit to this file.
+name: Build and publish
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Upstream matter-server version to package (e.g. 1.4.0)"
+                required: true
+                type: string
+            extra_tags:
+                description: "Additional tags, comma-separated (e.g. latest,stable)"
+                required: false
+                default: ""
+                type: string
+            ignore_drift:
+                description: "Publish even if the vendored Dockerfile has drifted from upstream"
+                required: false
+                default: false
+                type: boolean
+
+permissions:
+    contents: read
+    packages: write
+
+concurrency:
+    group: publish-${{ github.event.inputs.version }}
+    cancel-in-progress: false
+
+env:
+    # Decoupled from the repository name on purpose: this repo is the packaging project,
+    # while the image it produces keeps upstream's name.
+    IMAGE_NAME: matterjs-server
+    UPSTREAM_IMAGE: ghcr.io/matter-js/matterjs-server
+
+jobs:
+    drift-check:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Compare vendored files against upstream
+              id: drift
+              shell: bash
+              run: |
+                  if bash scripts/check-upstream-drift.sh "${{ github.event.inputs.version }}"; then
+                      echo "No drift." >> "$GITHUB_STEP_SUMMARY"
+                  else
+                      status=$?
+                      if [[ "$status" -eq 2 ]]; then
+                          echo "::error::Could not fetch upstream files for v${{ github.event.inputs.version }}."
+                          exit 2
+                      fi
+                      {
+                          echo "### Vendored files have drifted from upstream"
+                          echo
+                          echo "Upstream changed \`Dockerfile\` or \`healthcheck.sh\` in v${{ github.event.inputs.version }}."
+                          echo "Re-vendor before publishing, or re-run with \`ignore_drift\`."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                      if [[ "${{ github.event.inputs.ignore_drift }}" == "true" ]]; then
+                          echo "::warning::Drift detected; publishing anyway because ignore_drift was set."
+                      else
+                          echo "::error::Drift detected. Re-vendor, or re-run with ignore_drift."
+                          exit 1
+                      fi
+                  fi
+
+    build-armv7:
+        needs: [drift-check]
+        runs-on: ubuntu-latest
+        outputs:
+            digest: ${{ steps.build.outputs.digest }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@v3
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Resolve image name
+              id: meta
+              shell: bash
+              env:
+                  OWNER: ${{ github.repository_owner }}
+              run: |
+                  # ghcr.io rejects uppercase in the repository path
+                  owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+                  echo "image=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+            - name: Build armv7 and push by digest
+              id: build
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: ./Dockerfile
+                  platforms: linux/arm/v7
+                  build-args: |
+                      BASE_IMAGE=node:22-bookworm-slim
+                      MATTERJS_SERVER_VERSION=${{ github.event.inputs.version }}
+                  # Untagged; the tag is applied once, to the merged list, in the next job.
+                  outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+                  # Attestations would make the pushed digest an index rather than an image,
+                  # which imagetools cannot fold into a single manifest list.
+                  provenance: false
+                  sbom: false
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+    merge:
+        needs: [build-armv7]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Merge upstream and armv7 into one manifest list
+              id: merge
+              shell: bash
+              env:
+                  VERSION: ${{ github.event.inputs.version }}
+                  EXTRA_TAGS: ${{ github.event.inputs.extra_tags }}
+                  ARMV7_DIGEST: ${{ needs.build-armv7.outputs.digest }}
+                  OWNER: ${{ github.repository_owner }}
+              run: |
+                  set -euo pipefail
+                  owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+                  image="ghcr.io/${owner}/${IMAGE_NAME}"
+                  echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+                  raw=$(docker buildx imagetools inspect --raw "${UPSTREAM_IMAGE}:${VERSION}")
+
+                  # Select real platforms only: upstream's index also carries attestation
+                  # manifests, which report platform unknown/unknown and must not be merged.
+                  select_digest() {
+                      echo "$raw" | jq -r --arg arch "$1" \
+                          '.manifests[] | select(.platform.os=="linux" and .platform.architecture==$arch)
+                           | .digest' | head -n1
+                  }
+                  amd64=$(select_digest amd64)
+                  arm64=$(select_digest arm64)
+
+                  for pair in "amd64:$amd64" "arm64:$arm64"; do
+                      if [[ -z "${pair#*:}" ]]; then
+                          echo "::error::Upstream ${UPSTREAM_IMAGE}:${VERSION} has no ${pair%%:*} manifest."
+                          exit 1
+                      fi
+                  done
+                  echo "upstream amd64: $amd64"
+                  echo "upstream arm64: $arm64"
+                  echo "our armv7:      $ARMV7_DIGEST"
+
+                  tag_args=(-t "${image}:${VERSION}")
+                  IFS=',' read -ra extra <<< "$EXTRA_TAGS"
+                  for t in "${extra[@]}"; do
+                      t="${t// /}"
+                      if [[ -n "$t" ]]; then
+                          tag_args+=(-t "${image}:${t}")
+                      fi
+                  done
+
+                  docker buildx imagetools create "${tag_args[@]}" \
+                      "${UPSTREAM_IMAGE}@${amd64}" \
+                      "${UPSTREAM_IMAGE}@${arm64}" \
+                      "${image}@${ARMV7_DIGEST}"
+
+            - name: Verify published manifest covers all three platforms
+              shell: bash
+              env:
+                  IMAGE: ${{ steps.merge.outputs.image }}
+                  VERSION: ${{ github.event.inputs.version }}
+              run: |
+                  set -euo pipefail
+                  raw=$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}")
+                  platforms=$(echo "$raw" | jq -r \
+                      '.manifests[] | select(.platform.architecture != "unknown")
+                       | .platform.os + "/" + .platform.architecture
+                         + (if .platform.variant then "/" + .platform.variant else "" end)' \
+                      | sort)
+                  echo "$platforms"
+
+                  # A partially-merged tag is worse than a failed run: consumers would pull a
+                  # manifest that silently omits their architecture.
+                  for want in linux/amd64 linux/arm64 linux/arm/v7; do
+                      if ! grep -qx "$want" <<< "$platforms"; then
+                          echo "::error::Published manifest is missing ${want}."
+                          exit 1
+                      fi
+                  done
+
+                  {
+                      echo "### Published \`${VERSION}\`"
+                      echo
+                      echo '```bash'
+                      echo "docker pull ${IMAGE}:${VERSION}"
+                      echo '```'
+                      echo
+                      echo "| Platform | Source |"
+                      echo "|---|---|"
+                      echo "| linux/amd64 | upstream release image |"
+                      echo "| linux/arm64 | upstream release image |"
+                      echo "| linux/arm/v7 | built here, Node 22 bookworm |"
+                  } >> "$GITHUB_STEP_SUMMARY"

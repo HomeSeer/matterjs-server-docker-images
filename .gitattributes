@@ -1,0 +1,3 @@
+# Everything here is consumed by Linux containers; CRLF would break the shell
+# scripts and the Dockerfile heredocs regardless of the host checking them out.
+* text=auto eol=lf
