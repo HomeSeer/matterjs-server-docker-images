@@ -63,7 +63,13 @@ no edit to the workflow.
 ## Vendored files
 
 `Dockerfile` and `healthcheck.sh` are copied from upstream's `docker/matterjs-server/`.
-The only local modification is the `ARG BASE_IMAGE` line.
+The only local modification is the base image: a global `ARG BASE_IMAGE` at the top of
+the `Dockerfile`, and upstream's `FROM node:...` line rewritten to `FROM ${BASE_IMAGE}`.
+
+Upstream's `Dockerfile` opens with an empty `FROM scratch AS npm-packages` stage, which
+its own release build replaces with the packed npm tarballs via `--build-context`. This
+workflow passes no such context, so that stage stays empty and the image installs
+`matter-server@<version>` from npm.
 
 Check them against any upstream release:
 
@@ -84,14 +90,26 @@ curl -sfL $BASE/Dockerfile -o Dockerfile
 curl -sfL $BASE/healthcheck.sh -o healthcheck.sh
 ```
 
-then reapply the patch — replace the `FROM node:...` line with:
+then reapply the patch. Add these lines at the very top of `Dockerfile`, with the
+default set to whatever upstream's `FROM node:...` line names:
 
 ```dockerfile
+# Local patch: base image as a global ARG (before the first FROM) so armv7 can pin Node 22.
 ARG BASE_IMAGE=node:24-trixie-slim
+
+```
+
+and replace upstream's `FROM node:...` line with:
+
+```dockerfile
 FROM ${BASE_IMAGE}
 ```
 
-and re-run the drift check to confirm it comes back clean.
+The ARG must sit above the first `FROM`, not beside the `FROM node:...` line. An ARG
+declared after `FROM scratch AS npm-packages` belongs to that stage, the later `FROM`
+cannot see it, and the build fails with `base name (${BASE_IMAGE}) should not be blank`.
+
+Re-run the drift check to confirm it comes back clean.
 
 ## Consuming from the plugin
 

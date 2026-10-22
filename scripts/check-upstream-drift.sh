@@ -3,7 +3,9 @@
 # given release tag.
 #
 # The vendored Dockerfile carries exactly one deliberate change: the base image is
-# lifted into an overridable ARG so 32-bit ARM can pin an older Node. That change is
+# lifted into an overridable ARG so 32-bit ARM can pin an older Node. The ARG is
+# declared at the top of the file, ahead of upstream's `FROM scratch AS npm-packages`
+# stage — an ARG declared inside a stage is invisible to a later FROM. That change is
 # reapplied to upstream's file here, so a clean run means "identical apart from the
 # ARG", and any other upstream edit — a new system package, a changed ENTRYPOINT —
 # shows up as a real diff.
@@ -32,11 +34,23 @@ fetch() {
 fetch Dockerfile
 fetch healthcheck.sh
 
-# Reapply our one deliberate change to upstream's copy before comparing.
-sed -E 's|^FROM (node:.*)$|ARG BASE_IMAGE=\1\nFROM ${BASE_IMAGE}|' \
-    "${tmp}/Dockerfile" > "${tmp}/Dockerfile.expected"
-
 drift=0
+
+# Reapply our one deliberate change to upstream's copy before comparing: a global
+# ARG BASE_IMAGE at the top of the file, and upstream's node FROM line pointing at it.
+mapfile -t bases < <(sed -nE 's|^FROM (node:[^[:space:]]+)$|\1|p' "${tmp}/Dockerfile")
+if [[ "${#bases[@]}" -ne 1 ]]; then
+    echo "Upstream v${VERSION} Dockerfile has ${#bases[@]} 'FROM node:...' lines, expected 1;" \
+        "the ARG BASE_IMAGE patch needs revisiting." >&2
+    drift=1
+fi
+{
+    echo "# Local patch: base image as a global ARG (before the first FROM) so armv7 can pin Node 22."
+    echo "ARG BASE_IMAGE=${bases[0]:-}"
+    echo
+    sed -E 's|^FROM node:[^[:space:]]+$|FROM ${BASE_IMAGE}|' "${tmp}/Dockerfile"
+} > "${tmp}/Dockerfile.expected"
+
 if ! diff -u "${tmp}/Dockerfile.expected" "${here}/Dockerfile" \
     --label "upstream v${VERSION} (ARG patch applied)" --label "vendored"; then
     drift=1
@@ -54,6 +68,6 @@ else
     echo "Review the diff above and re-vendor if the change should be carried:"
     echo "  curl -sfL ${UPSTREAM_RAW}/Dockerfile -o Dockerfile"
     echo "  curl -sfL ${UPSTREAM_RAW}/healthcheck.sh -o healthcheck.sh"
-    echo "  # then reapply the ARG BASE_IMAGE patch to the FROM line"
+    echo "  # then reapply the ARG BASE_IMAGE patch (README.md, \"Vendored files\")"
 fi
 exit "$drift"
